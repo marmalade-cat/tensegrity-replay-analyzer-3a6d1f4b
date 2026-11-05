@@ -1,0 +1,188 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tensegrity Replay Analyzer - Prototype</title>
+<style>
+body{font-family:system-ui,Arial;margin:12px;color:#222}
+#drop{border:2px dashed #888;padding:18px;text-align:center;margin-bottom:8px}
+canvas{width:100%;height:400px;background:#111;display:block}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+textarea{width:100%;height:120px;font-family:monospace}
+button,select,input{padding:6px}
+</style>
+</head>
+<body>
+<h3>Tensegrity Replay Analyzer (prototype)</h3>
+<div id="drop">Drop CSV or JSON here, or <input id="file" type="file"></div>
+<div class="controls">
+<label><input type="checkbox" id="normTime" checked> Normalize time to 0</label>
+<label>Coordinate frame: <select id="frame"><option value="none">None</option><option value="flipX">Flip X</option><option value="flipY">Flip Y</option><option value="swapXY">Swap X/Y</option></select></label>
+<button id="export">Export Replay JSON</button>
+<button id="clear">Clear</button>
+</div>
+<canvas id="gl"></canvas>
+<div>
+<label>2D Top View:</label>
+<canvas id="top" width=600 height=300 style="border:1px solid #ccc"></canvas>
+</div>
+<label>Parsed / Export JSON:</label>
+<textarea id="out" readonly></textarea>
+<script>
+// Minimal parser and visualizer. No external libs.
+const fileInput = document.getElementById('file');
+const drop = document.getElementById('drop');
+const out = document.getElementById('out');
+let records = [];
+
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/).filter(l=>l.trim());
+  const hdr = lines[0].split(',').map(s=>s.trim());
+  const idx = name => Math.max(0,hdr.indexOf(name));
+  const want = ['timestamp','x','y','z','qw','qx','qy','qz','module_id'];
+  return lines.slice(1).map(line=>{
+    const cols = line.split(',').map(s=>s.trim());
+    const obj = {};
+    want.forEach((k,i)=> obj[k]=cols[hdr.indexOf(k)]);
+    return obj;
+  }).map(r=>({t:parseFloat(r.timestamp), module_id:r.module_id, pos:[+r.x,+r.y,+r.z], quat:[+r.qw,+r.qx,+r.qy,+r.qz]}));
+}
+function parseJSON(text){
+  const j = JSON.parse(text);
+  // Expect array of records with keys: timestamp,x,y,z,qw,qx,qy,qz,module_id or already normalized
+  return j.map(r=>({t:('timestamp' in r)?+r.timestamp:+r.t, module_id:r.module_id||r.module_id, pos:[+r.x,+r.y,+r.z], quat:[+r.qw,+(+r.qx),+r.qy,+r.qz]}));
+}
+
+function normalizeAndFrame(raw){
+  if(raw.length===0) return [];
+  const t0 = document.getElementById('normTime').checked ? raw.reduce((a,b)=>Math.min(a,b.t),Infinity) : 0;
+  const frame = document.getElementById('frame').value;
+  return raw.map(r=>{
+    let [x,y,z]=r.pos;
+    if(frame==='flipX') x = -x;
+    if(frame==='flipY') y = -y;
+    if(frame==='swapXY') [x,y]=[y,x];
+    return {t: r.t - t0, module_id: r.module_id, pos:[x,y,z], quat:r.quat};
+  }).sort((a,b)=>a.t-b.t);
+}
+
+function dumpAndVisualize(){
+  const processed = normalizeAndFrame(records);
+  out.value = JSON.stringify(processed,null,2);
+  drawTop(processed);
+  draw3D(processed);
+}
+
+fileInput.addEventListener('change',e=>handleFile(e.target.files[0]));
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.style.borderColor='#66f'}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.style.borderColor='#888'}));
+drop.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];handleFile(f)});
+
+function handleFile(file){
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=e=>{
+    const txt=e.target.result;
+    try{
+      if(file.name.match(/\.csv$/i)) records = parseCSV(txt);
+      else records = parseJSON(txt);
+      dumpAndVisualize();
+    }catch(err){ alert('Parse error: '+err.message); }
+  };
+  reader.readAsText(file);
+}
+
+document.getElementById('export').addEventListener('click',()=>{
+  const data = normalizeAndFrame(records);
+  const blob = new Blob([JSON.stringify(data)],{type:'application/json'});
+  const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='replay.json'; a.click();
+});
+
+document.getElementById('clear').addEventListener('click',()=>{records=[];out.value='';clearCanvases();});
+
+afterload();
+
+// --- simple 2D top view renderer ---
+const top = document.getElementById('top');
+const tctx = top.getContext('2d');
+function clearCanvases(){ tctx.clearRect(0,0,top.width,top.height); const glc = document.getElementById('gl').getContext('2d'); }
+function drawTop(data){
+  tctx.clearRect(0,0,top.width,top.height);
+  if(data.length===0) return;
+  // collect all positions per module
+  const byMod = {};
+  data.forEach(r=>{ (byMod[r.module_id] = byMod[r.module_id]||[]).push(r.pos); });
+  // bounds
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+  Object.values(byMod).flat().forEach(p=>{minX=Math.min(minX,p[0]); minY=Math.min(minY,p[1]); maxX=Math.max(maxX,p[0]); maxY=Math.max(maxY,p[1]);});
+  if(!isFinite(minX)){return}
+  const pad=20; const W=top.width-2*pad, H=top.height-2*pad;
+  const scale = Math.max(1e-6, Math.max((maxX-minX)/W,(maxY-minY)/H));
+  const cols=['#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00'];
+  let ci=0;
+  for(const mid in byMod){
+    const pts = byMod[mid];
+    tctx.beginPath();
+    pts.forEach((p,i)=>{
+      const sx = pad + (p[0]-minX)/ (scale*W) * W;
+      const sy = pad + (1 - (p[1]-minY)/(scale*H)) * H;
+      if(i===0) tctx.moveTo(sx,sy); else tctx.lineTo(sx,sy);
+    });
+    tctx.strokeStyle = cols[ci % cols.length]; tctx.lineWidth=2; tctx.stroke();
+    // draw last point
+    const lp = pts[pts.length-1];
+    const sx = pad + (lp[0]-minX)/ (scale*W) * W;
+    const sy = pad + (1 - (lp[1]-minY)/(scale*H)) * H;
+    tctx.fillStyle=cols[ci % cols.length]; tctx.fillRect(sx-3,sy-3,6,6);
+    tctx.fillStyle='#000'; tctx.fillText(mid, sx+6, sy+6);
+    ci++;
+  }
+}
+
+// --- tiny 3D wireframe using canvas 2D for simplicity (orbit minimal) ---
+const glCanvas = document.getElementById('gl');
+const gctx = glCanvas.getContext('2d');
+let rotX=0.4, rotY=0.6, zoom=1.2; let dragging=false, last=[0,0];
+function project(p){
+  const [x,y,z]=p;
+  // rotate
+  const cx = Math.cos(rotX), sx=Math.sin(rotX); const cy=Math.cos(rotY), sy=Math.sin(rotY);
+  let rx = cy*x + sy*z;
+  let rz = -sy*x + cy*z;
+  let ry = cx*y - sx*rz;
+  rz = sx*y + cx*rz;
+  const f = 200*zoom;
+  const sx2 = glCanvas.width/2 + rx * f / (rz+400);
+  const sy2 = glCanvas.height/2 - ry * f / (rz+400);
+  return [sx2,sy2];
+}
+function draw3D(data){
+  gctx.clearRect(0,0,glCanvas.width,glCanvas.height);
+  if(!data.length) return;
+  const byMod = {};
+  data.forEach(r=>{ (byMod[r.module_id] = byMod[r.module_id]||[]).push(r.pos); });
+  // draw trajectories
+  const cols=['#ffd700','#66c2a5','#fc8d62','#8da0cb','#e78ac3']; let ci=0;
+  for(const mid in byMod){
+    const pts = byMod[mid];
+    gctx.beginPath();
+    pts.forEach((p,i)=>{const pr=project(p); if(i===0)gctx.moveTo(pr[0],pr[1]); else gctx.lineTo(pr[0],pr[1]);});
+    gctx.strokeStyle=cols[ci%cols.length]; gctx.lineWidth=2; gctx.stroke();
+    // last
+    const lp=pts[pts.length-1]; const pr=project(lp); gctx.fillStyle=cols[ci%cols.length]; gctx.beginPath(); gctx.arc(pr[0],pr[1],4,0,6.28); gctx.fill(); gctx.fillStyle='#000'; gctx.fillText(mid,pr[0]+6,pr[1]+4);
+    ci++;
+  }
+}
+
+// simple resize
+function afterload(){ glCanvas.width = Math.min(window.innerWidth-40,1200); glCanvas.height=400; }
+window.addEventListener('resize',afterload);
+// orbit
+glCanvas.addEventListener('mousedown',e=>{dragging=true; last=[e.clientX,e.clientY];});
+window.addEventListener('mouseup',()=>dragging=false);
+window.addEventListener('mousemove',e=>{ if(dragging){ rotY += (e.clientX-last[0])/200; rotX += (e.clientY-last[1])/200; last=[e.clientX,e.clientY]; draw3D(normalizeAndFrame(records)); }});
+window.addEventListener('wheel',e=>{ zoom *= e.deltaY>0?0.95:1.05; draw3D(normalizeAndFrame(records)); e.preventDefault();}, {passive:false});
+
+</script>
+</body>
+</html>
